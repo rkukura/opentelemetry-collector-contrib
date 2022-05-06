@@ -22,11 +22,13 @@ import (
 	"net/http"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.uber.org/zap"
 )
 
 var (
@@ -74,7 +76,7 @@ func TestBasicAuth_Valid(t *testing.T) {
 		Htpasswd: &HtpasswdSettings{
 			File: f.Name(),
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 
 	require.NoError(t, ext.Start(ctx, componenttest.NewNopHost()))
@@ -99,7 +101,7 @@ func TestBasicAuth_InvalidCredentials(t *testing.T) {
 		Htpasswd: &HtpasswdSettings{
 			Inline: "username:password",
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 	require.NoError(t, ext.Start(context.Background(), componenttest.NewNopHost()))
 	_, err = ext.Authenticate(context.Background(), map[string][]string{"authorization": {"Basic dXNlcm5hbWU6cGFzc3dvcmR4eHg="}})
@@ -111,7 +113,7 @@ func TestBasicAuth_NoHeader(t *testing.T) {
 		Htpasswd: &HtpasswdSettings{
 			Inline: "username:password",
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 	_, err = ext.Authenticate(context.Background(), map[string][]string{})
 	assert.Equal(t, errNoAuth, err)
@@ -122,7 +124,7 @@ func TestBasicAuth_InvalidPrefix(t *testing.T) {
 		Htpasswd: &HtpasswdSettings{
 			Inline: "username:password",
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 	_, err = ext.Authenticate(context.Background(), map[string][]string{"authorization": {"Bearer token"}})
 	assert.Equal(t, errInvalidSchemePrefix, err)
@@ -133,7 +135,7 @@ func TestBasicAuth_NoFile(t *testing.T) {
 		Htpasswd: &HtpasswdSettings{
 			File: "/non/existing/file",
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 	require.NotNil(t, ext)
 
@@ -145,7 +147,7 @@ func TestBasicAuth_InvalidFormat(t *testing.T) {
 		Htpasswd: &HtpasswdSettings{
 			Inline: "username:password",
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 	for _, auth := range [][]string{
 		{"non decodable", "invalid"},
@@ -171,7 +173,7 @@ func TestBasicAuth_HtpasswdInlinePrecedence(t *testing.T) {
 			File:   f.Name(),
 			Inline: "username:frominline",
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 	require.NoError(t, ext.Start(context.Background(), componenttest.NewNopHost()))
 
@@ -186,12 +188,50 @@ func TestBasicAuth_HtpasswdInlinePrecedence(t *testing.T) {
 	assert.Error(t, errInvalidCredentials, err)
 }
 
+func TestBasicAuth_HtpasswdWatcher(t *testing.T) {
+	t.Parallel()
+	f, err := ioutil.TempFile("", ".htpasswd")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+
+	f.WriteString("username:fromfile\n")
+
+	logger, _ := zap.NewDevelopment()
+	ext, err := newServerAuthExtension(&Config{
+		Htpasswd: &HtpasswdSettings{
+			File:   f.Name(),
+			Inline: "username:frominline",
+		},
+	}, logger)
+	require.NoError(t, err)
+	require.NoError(t, ext.Start(context.Background(), componenttest.NewNopHost()))
+
+	auth := base64.StdEncoding.EncodeToString([]byte("username:frominline"))
+
+	_, err = ext.Authenticate(context.Background(), map[string][]string{"authorization": {"Basic " + auth}})
+	assert.NoError(t, err)
+
+	auth = base64.StdEncoding.EncodeToString([]byte("username:fromfile"))
+
+	_, err = ext.Authenticate(context.Background(), map[string][]string{"authorization": {"Basic " + auth}})
+	assert.Error(t, errInvalidCredentials, err)
+
+	f.WriteString("username2:fromfile\n")
+	f.Sync()
+	time.Sleep(1 * time.Second)
+
+	auth = base64.StdEncoding.EncodeToString([]byte("username2:fromfile"))
+
+	_, err = ext.Authenticate(context.Background(), map[string][]string{"authorization": {"Basic " + auth}})
+	assert.NoError(t, err)
+}
+
 func TestBasicAuth_SupportedHeaders(t *testing.T) {
 	ext, err := newServerAuthExtension(&Config{
 		Htpasswd: &HtpasswdSettings{
 			Inline: "username:password",
 		},
-	})
+	}, zap.NewNop())
 	require.NoError(t, err)
 	require.NoError(t, ext.Start(context.Background(), componenttest.NewNopHost()))
 
@@ -210,7 +250,7 @@ func TestBasicAuth_SupportedHeaders(t *testing.T) {
 func TestBasicAuth_ServerInvalid(t *testing.T) {
 	_, err := newServerAuthExtension(&Config{
 		Htpasswd: &HtpasswdSettings{},
-	})
+	}, zap.NewNop())
 	assert.Error(t, err)
 }
 

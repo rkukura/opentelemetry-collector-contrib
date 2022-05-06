@@ -24,10 +24,12 @@ import (
 	"os"
 	"strings"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/tg123/go-htpasswd"
 	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configauth"
+	"go.uber.org/zap"
 	creds "google.golang.org/grpc/credentials"
 )
 
@@ -41,7 +43,8 @@ var (
 type basicAuth struct {
 	htpasswd   *HtpasswdSettings
 	clientAuth *ClientAuthSettings
-	matchFunc  func(username, password string) bool
+	htp        *htpasswd.File
+	logger     *zap.Logger
 }
 
 func newClientAuthExtension(cfg *Config) (configauth.ClientAuthenticator, error) {
@@ -58,7 +61,7 @@ func newClientAuthExtension(cfg *Config) (configauth.ClientAuthenticator, error)
 	), nil
 }
 
-func newServerAuthExtension(cfg *Config) (configauth.ServerAuthenticator, error) {
+func newServerAuthExtension(cfg *Config, logger *zap.Logger) (configauth.ServerAuthenticator, error) {
 
 	if cfg.Htpasswd == nil || (cfg.Htpasswd.File == "" && cfg.Htpasswd.Inline == "") {
 		return nil, errNoCredentialSource
@@ -66,6 +69,7 @@ func newServerAuthExtension(cfg *Config) (configauth.ServerAuthenticator, error)
 
 	ba := basicAuth{
 		htpasswd: cfg.Htpasswd,
+		logger:   logger,
 	}
 	return configauth.NewServerAuthenticator(
 		configauth.WithStart(ba.serverStart),
@@ -77,6 +81,8 @@ func (ba *basicAuth) serverStart(ctx context.Context, host component.Host) error
 	var rs []io.Reader
 
 	if ba.htpasswd.File != "" {
+		ba.logger.Info("Loading htpasswd file", zap.String("filename", ba.htpasswd.File))
+
 		f, err := os.Open(ba.htpasswd.File)
 		if err != nil {
 			return fmt.Errorf("open htpasswd file: %w", err)
@@ -92,14 +98,104 @@ func (ba *basicAuth) serverStart(ctx context.Context, host component.Host) error
 	rs = append(rs, strings.NewReader(ba.htpasswd.Inline))
 	mr := io.MultiReader(rs...)
 
-	htp, err := htpasswd.NewFromReader(mr, htpasswd.DefaultSystems, nil)
+	bad := 0
+	htp, err := htpasswd.NewFromReader(mr, htpasswd.DefaultSystems, func(_ error) { bad++ })
 	if err != nil {
 		return fmt.Errorf("read htpasswd content: %w", err)
 	}
+	if bad != 0 {
+		ba.logger.Warn(fmt.Sprintf("Ignored %v bad lines loading htpasswds", bad))
+	}
+	ba.htp = htp
 
-	ba.matchFunc = htp.Match
+	err = ba.watchHtpasswd()
+	if err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func (ba *basicAuth) watchHtpasswd() error {
+	if ba.htpasswd.File == "" {
+		return nil
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("fsnotify.NewWatcher: %w", err)
+	}
+
+	err = watcher.Add(ba.htpasswd.File)
+	if err != nil {
+		watcher.Close()
+		return fmt.Errorf("watcher.Add: %w", err)
+	}
+
+	go func() {
+		defer watcher.Close()
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Remove == fsnotify.Remove {
+					// Kubernetes uses symlinks to atomically update mounted configmaps and
+					// secrets. The fsnotify package follows the symlink when the file is
+					// added to the watcher, so a remove notification indicates the old file
+					// has been deleted. This is done after the new file has been created
+					// and the symlink updated, so we just need to start watching the new
+					// file and process its contents. If the old file was deleted without a
+					// symlinked replacement, trying to add the file will fail and we stop
+					// watching.
+					err = watcher.Add(ba.htpasswd.File)
+					if err != nil {
+						return
+					}
+					ba.reloadHtpasswd()
+				} else if event.Op&fsnotify.Write == fsnotify.Write {
+					ba.reloadHtpasswd()
+				}
+			case _, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (ba *basicAuth) reloadHtpasswd() {
+	var rs []io.Reader
+
+	ba.logger.Info("Reloading htpasswd file", zap.String("filename", ba.htpasswd.File))
+
+	f, err := os.Open(ba.htpasswd.File)
+	if err != nil {
+		ba.logger.Error("Failed opening htpasswd file", zap.Error(err))
+		return
+	}
+	defer f.Close()
+
+	rs = append(rs, f)
+	rs = append(rs, strings.NewReader("\n"))
+
+	// Ensure that the inline content is read the last.
+	// This way the inline content will override the content from file.
+	rs = append(rs, strings.NewReader(ba.htpasswd.Inline))
+	mr := io.MultiReader(rs...)
+
+	bad := 0
+	err = ba.htp.ReloadFromReader(mr, func(_ error) { bad++ })
+	if err != nil {
+		ba.logger.Error("Failed reloading htpasswd content: %w", zap.String("filename", ba.htpasswd.File), zap.Error(err))
+	}
+	if bad != 0 {
+		ba.logger.Warn(fmt.Sprintf("Ignored %v bad lines reloading htpasswds", bad))
+	}
 }
 
 func (ba *basicAuth) authenticate(ctx context.Context, headers map[string][]string) (context.Context, error) {
@@ -113,7 +209,7 @@ func (ba *basicAuth) authenticate(ctx context.Context, headers map[string][]stri
 		return ctx, err
 	}
 
-	if !ba.matchFunc(authData.username, authData.password) {
+	if !ba.htp.Match(authData.username, authData.password) {
 		return ctx, errInvalidCredentials
 	}
 
